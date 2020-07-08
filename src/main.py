@@ -18,6 +18,9 @@ from pathlib import Path
 import datetime
 import time
 import cftime
+import tempfile
+import subprocess
+from subprocess import check_call
 
 import osr
 import click
@@ -36,9 +39,38 @@ __summer__ = [11, 0, 1]  # December, January and February
 __autumn__ = [2, 3, 4]  # March, April and May
 __winter__ = [5, 6, 7]  # June, July and August
 
+__composite_map__ = {
+    'season': {
+        'spring': __spring__,
+        'summer': __summer__,
+        'autumn': __autumn__,
+        'winter': __winter__,
+    },
+    'month': {
+        'January': [0],
+        'February': [1],
+        'March': [2],
+        'April': [3],
+        'May': [4],
+        'June': [5],
+        'July': [6],
+        'August': [7],
+        'September': [8],
+        'October': [9],
+        'November': [10],
+        'December': [11]
+    }
+}
 __outfile_fmt__ = (
     "FC_{c}_Medoid.v{ver}.MCD43A4.h{h:02d}v{v:02d}.{year}.006.tif"
     )
+__west__ = [(27, 11), (27, 12), (28, 11), (29, 11), (28, 12), (29, 12)]
+__WA_BOUNDS__ = ('114.0', '-35.5', '123.5', '-26.5')
+
+__base_url__ = (
+    "http://dapds00.nci.org.au/thredds/fileServer/"
+    "tc43/modis-fc/v310/tiles/8-day/cover/"
+)
 
 
 def read_gospatial(filename):
@@ -53,6 +85,22 @@ def read_gospatial(filename):
                     'crs_wkt': sds.crs.wkt
                 }
     return geospatial
+
+
+def download(
+    filename,
+    outdir,
+):
+    """downloads data from nci thread server"""
+    url = f"{__base_url__}{filename}"
+
+    cmd = ["wget", url, "-P", outdir]
+    try:
+        check_call(cmd)
+    except subprocess.CalledProcessError as err:
+        raise err
+
+    return Path(outdir).joinpath(filename)
 
 
 def write_img(
@@ -120,30 +168,8 @@ def pack_data(
     year,
 ):
     geo_spatial = read_gospatial(src_filename)
-    composite_index_map = {
-        'season': {
-            'spring': __spring__,
-            'summer': __summer__,
-            'autumn': __autumn__,
-            'winter': __winter__,
-        },
-        'month': {
-            'January': [0],
-            'February': [1],
-            'March': [2],
-            'April': [3],
-            'May': [4],
-            'June': [5],
-            'July': [6],
-            'August': [7],
-            'September': [8],
-            'October': [9],
-            'November': [10],
-            'December': [11]
-        }
-    }
     for time_idx, dt in enumerate(timestamps):
-        composite_map = composite_index_map[composite_type]
+        composite_map = __composite_map__[composite_type]
         for composite, composite_months in composite_map.items():
             if dt.month - 1 in composite_months:
                 for fc_type, fc_index in __fc__.items():
@@ -160,7 +186,7 @@ def pack_data(
                         output_dir.joinpath(outfile),
                         geo_spatial[fc_type]['geotransform'],
                         geo_spatial[fc_type]['crs_wkt'],
-                        nodata = 255
+                        nodata=255
                     )
 
 
@@ -243,15 +269,13 @@ def compute_medoid(filename, output_dir, ver, composite_type, htile, vtile, year
 
         elif composite_type == "season":
             # compute seasonal medoid
-            season_data_list = []
-            season_timestamp_list = []
             for s, s_idx in enumerate(season_idx):
                 sdata = data[s_idx, ...]
                 season_medoid = medoid(sdata)
-                season_data_list.append(season_medoid)
+                medoid_data_list.append(season_medoid)
                 ts = cftime.num2pydate(ds['time'][s_idx[0]], ds['time'].units)
                 ts = ts.replace(day=1)
-                season_timestamp_list.append(ts)
+                medoid_timestamp_list.append(ts)
                 season = s + 1
                 print(
                     "season:%d, org_mean:%.4f, org_min:%.4f, org_max:%.4f"
@@ -293,6 +317,49 @@ def compute_medoid(filename, output_dir, ver, composite_type, htile, vtile, year
         )
 
 
+def build_vrt_mosaic(indir, outdir, composite_type, region, year):
+    indir = Path(indir)
+    outdir = Path(outdir)
+
+    if region == "west":
+        bounds = __WA_BOUNDS__
+    else:
+        raise NotImplementedError(f"{region} not implemented")
+
+    composite = __composite_map__[composite_type]
+    for comp in composite.keys():
+        for cov in __fc__.keys():
+            with tempfile.TemporaryDirectory() as tmpdir:
+                inputfile = Path(tmpdir).joinpath(f"{comp}_{cov}.txt")
+                with open(inputfile, 'w') as fid:
+                    out_vrt = Path(tmpdir).joinpath(f"{comp}_{cov}.vrt")
+                    for fname in indir.rglob(f"FC_*{comp}_{cov}*.tif"):
+                        fid.writelines(str(fname) + "\n")
+                        fid.flush()
+                    cmd = [
+                        'gdalbuildvrt',
+                        '-input_file_list',
+                        inputfile.as_posix(),
+                        out_vrt.as_posix()
+                    ]
+                    check_call(cmd)
+
+                    outfile = outdir.joinpath(f"{comp}_{cov}_{year}_{region}.tif")
+                    cmd = [
+                        'gdalwarp',
+                        '-t_srs',
+                        'EPSG:4326',
+                        '-te',
+                        str(bounds[0]),
+                        str(bounds[1]),
+                        str(bounds[2]),
+                        str(bounds[3]),
+                        out_vrt.as_posix(),
+                        out_vrt.with_suffix(".tif").as_posix()
+                    ]
+                    check_call(cmd)
+
+
 @click.command(
     "--fc-medoid-process",
     help="Processing fractional cover medoid"
@@ -301,20 +368,13 @@ def compute_medoid(filename, output_dir, ver, composite_type, htile, vtile, year
     "--src-root-dir",
     help="source root path",
     type=click.Path(dir_okay=True, file_okay=False),
-    required=True
+    default=os.getcwd()
 )
 @click.option(
-    "-h",
-    "--horizontal-tile",
-    help="horizontal tile of source file",
-    type=click.INT,
-    required=True
-)
-@click.option(
-    "-v",
-    "--vertical-tile",
-    help="vertical tile of source file",
-    type=click.INT,
+    "-r",
+    "--region",
+    help="region to process: west, east, australia",
+    type=click.STRING,
     required=True
 )
 @click.option(
@@ -327,7 +387,7 @@ def compute_medoid(filename, output_dir, ver, composite_type, htile, vtile, year
     "--output-dir",
     help="Full path to destination directroy.",
     type=click.Path(dir_okay=True, file_okay=False),
-    required=True,
+    default=os.getcwd(),
 )
 @click.option(
     "--composite-type",
@@ -345,27 +405,45 @@ def compute_medoid(filename, output_dir, ver, composite_type, htile, vtile, year
 )
 def main(
     src_root_dir: click.Path,
-    horizontal_tile: click.INT,
-    vertical_tile: click.INT,
+    region: click.STRING,
     year: click.INT,
     output_dir: click.Path,
     composite_type: click.STRING,
     version: click.STRING
 ):
-    src_filename = Path(src_root_dir).joinpath(
-        f"FC.v{version}.MCD43A4.h{horizontal_tile:02d}"
-        f"v{vertical_tile:02}.{year}.006.nc"
-    )
 
-    compute_medoid(
-        src_filename,
-        Path(output_dir),
-        version,
-        composite_type,
-        horizontal_tile,
-        vertical_tile,
-        year
-    )
+    if region == "west":
+       tiles = __west__
+    else:
+        raise NotImplementedError(f"{region} not implemented")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        outdir = Path(output_dir).joinpath(f"{region}{year}")
+        outdir.mkdir(exist_ok=True)
+        indir = Path(tmpdir)
+        for htile, vtile in tiles:
+            fname = (
+                f"FC.v{version}.MCD43A4.h{htile:02d}"
+                f"v{vtile:02}.{year}.006.nc"
+            )
+
+            fc_path = Path(src_root_dir).joinpath(fname)
+
+            # if file does not exists then download from nci
+            # thread serer
+            if not fc_path.exists():
+                fc_path = download(fname, tmpdir)
+
+            compute_medoid(
+                fc_path,
+                indir,
+                version,
+                composite_type,
+                htile,
+                vtile,
+                year
+            )
+        build_vrt_mosaic(indir, outdir, composite_type, region, year)
 
 
 if __name__ == "__main__":
