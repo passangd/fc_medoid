@@ -1,34 +1,34 @@
-# Copyright 2017 National Computational Infrastructure(NCI).
-# All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# =========================================================================
+#!/usr/bin/env python3
+
 import os
-from pathlib import Path
+import sys
+import warnings
 import datetime
 import cftime
 import tempfile
 import subprocess
+import uuid
+import logging
+import logging.config
+import shutil
 from subprocess import check_call
+from pathlib import Path
+from typing import Optional, Union, List
 
+import yaml
+import boto3
 import osr
 import click
 import netCDF4
 import rasterio
-from rasterio import Affine
-from rasterio.enums import Resampling
-
 import numpy as np
+from rasterio import Affine
+from rasterio import logging as rio_log
+from rasterio.enums import Resampling
+from botocore.exceptions import ClientError
+
+log = rio_log.getLogger()
+log.setLevel(logging.ERROR)
 
 from fast_medoid import medoid
 
@@ -40,10 +40,10 @@ __winter__ = [5, 6, 7]  # June, July and August
 
 __composite_map__ = {
     "season": {
-        "spring": __spring__,
-        "summer": __summer__,
-        "autumn": __autumn__,
-        "winter": __winter__,
+        "Spring": __spring__,
+        "Summer": __summer__,
+        "Autumn": __autumn__,
+        "Winter": __winter__,
     },
     "month": {
         "January": [0],
@@ -60,6 +60,23 @@ __composite_map__ = {
         "December": [11],
     },
 }
+__index_map__ = {
+    "season": {0: "Spring", 1: "Summer", 2: "Autumn", 3: "Winter",},
+    "month": {
+        0: "January",
+        1: "February",
+        2: "March",
+        3: "April",
+        4: "May",
+        5: "June",
+        6: "July",
+        7: "August",
+        8: "September",
+        9: "October",
+        10: "November",
+        11: "December",
+    },
+}
 __outfile_fmt__ = (
     "FC_{c}_Medoid.v{ver}.MCD43A4.h{h:02d}v{v:02d}.{year}.006.tif"
 )
@@ -74,7 +91,7 @@ __west__ = [
     (29, 11),
     (29, 12),
     (30, 10),
-    (30, 11)
+    (30, 11),
 ]
 __WA_BOUNDS__ = ("112.5", "-35.5", "129.5", "-13.45")
 
@@ -98,13 +115,53 @@ def read_gospatial(filename):
     return geospatial
 
 
+def s3_upload(
+    up_file: Union[str, Path],
+    s3_client: boto3.Session.client,
+    bucket: str,
+    prefix: Optional[str] = "",
+    replace: Optional[bool] = True,
+):
+    """Uploads file into s3_bucket in a prefix folder.
+
+    :param up_file: Full path to file that will be uploaded to s3.
+    :param s3_client: s3 client to upload the files.
+    :param bucket: The name of s3 bucket to upload the files into.
+    :param prefix: The output directory to put file in s3 bucket.
+    :param replace: Optional parameter to specify if files in s3 bucket
+                    is to be replaced if it exists.
+    :return:
+        True if uploaded, else False
+    :raises:
+        ValueError if file fails to upload to s3 bucket.
+    """
+
+    filename = Path(up_file).name
+    s3_path = f"{prefix}/{filename}"
+    try:
+        s3_client.head_object(Bucket=bucket, Key=s3_path)
+        if replace:
+            s3_client.upload_file(up_file.as_posix(), bucket, Key=s3_path)
+        else:
+            STATUS_LOGGER.info(
+                f"{filename} exists in {bucket}/{prefix}, skipped upload"
+            )
+    except ClientError:
+        try:
+            s3_client.upload_file(up_file.as_posix(), bucket, Key=s3_path)
+        except ClientError:
+            raise ValueError(
+                f"failed to upload {filename} at {bucket}/{prefix}"
+            )
+
+
 def download(
     filename, outdir,
 ):
     """downloads data from nci thread server"""
     url = f"{__base_url__}{filename}"
 
-    cmd = ["wget", url, "-P", outdir]
+    cmd = ["wget", '-q', url, "-P", outdir]
     try:
         check_call(cmd)
     except subprocess.CalledProcessError as err:
@@ -152,6 +209,26 @@ def write_img(
         dst.write(data, 1)
 
 
+def _munge_metadata(metadata_doc: dict, outfile: Path):
+    """Consolidates the metadata used in processing stormsurge.
+
+    :param metadata_doc: The lineage informations related to the
+                              stormsurge product.
+    :param outfile: The output filename where metadata will be written.
+    """
+    lineage = dict()
+    for param, val in metadata_doc["lineage"].items():
+        if isinstance(val, dict):
+            for _param, _val in val.items():
+                lineage[_param] = _val
+        else:
+            lineage[param] = val
+
+    metadata_doc["lineage"] = lineage
+    with open(outfile.as_posix(), "w") as fid:
+        yaml.dump(metadata_doc, fid, sort_keys=False)
+
+
 def pack_data(
     src_filename,
     output_dir,
@@ -194,9 +271,21 @@ def compute_medoid(
         month_idx_tmp = [[] for _ in range(12)]
         season_idx_tmp = [[] for _ in range(4)]
 
+        month_idx_dates = dict()
+        season_idx_dates = dict()
+
         for its, ts in enumerate(ds["time"]):
-            date = netCDF4.num2date(ts, ds["time"].units)
+            date = cftime.num2pydate(ts, ds["time"].units)
             month_idx_tmp[date.month - 1].append(its)
+
+            try:
+                month_idx_dates[__index_map__["month"][date.month - 1]].append(
+                    date
+                )
+            except KeyError:
+                month_idx_dates[__index_map__["month"][date.month - 1]] = [
+                    date
+                ]
 
             # gather data index if data falls in season's month
             for _its, season in enumerate(
@@ -204,6 +293,15 @@ def compute_medoid(
             ):
                 if date.month - 1 in season:
                     season_idx_tmp[_its].append(its)
+                    try:
+                        season_idx_dates[__index_map__["season"][_its]].append(
+                            date
+                        )
+                    except KeyError:
+                        season_idx_dates[__index_map__["season"][_its]] = [
+                            date
+                        ]
+
         # The following checks that if the current month is complete
         # We only compute medoids if the current month is complete
         for i in range(len(month_idx_tmp)):
@@ -215,7 +313,9 @@ def compute_medoid(
 
             if ts.month == next_date.month:
                 if ts.year == 2001 and ts.month == 6:
-                    print("Problem here incomplete files but still will do")
+                    STATUS_LOGGER.info(
+                        "Incomplete files encountered, still processed"
+                    )
                 else:
                     month_idx_tmp[i] = []
 
@@ -237,6 +337,7 @@ def compute_medoid(
         medoid_timestamp_list = []
         if composite_type == "month":
             # compute monthly medoid
+            dates_composite = month_idx_dates
             for m, m_idx in enumerate(month_idx):
                 d = data[m_idx, ...]
                 month_medoid = medoid(d)
@@ -246,6 +347,7 @@ def compute_medoid(
                 medoid_timestamp_list.append(ts)
         elif composite_type == "season":
             # compute seasonal medoid
+            dates_composite = season_idx_dates
             for s, s_idx in enumerate(season_idx):
                 sdata = data[s_idx, ...]
                 season_medoid = medoid(sdata)
@@ -259,25 +361,27 @@ def compute_medoid(
             )
 
         if len(medoid_data_list) == 0:
-            print("no data for %s" % filename)
+            STATUS_LOGGER.info(f"no data for {filename}")
             return
 
         if len(medoid_data_list) == 1:
             medoid_data = np.expand_dims(medoid_data_list[0], axis=0)
         else:
             medoid_data = np.stack(medoid_data_list)
-
-        pack_data(
-            filename,
-            output_dir,
-            medoid_data,
-            medoid_timestamp_list,
-            composite_type,
-            ver,
-            htile,
-            vtile,
-            year,
-        )
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=rasterio.errors.NotGeoreferencedWarning)
+                pack_data(
+                    filename,
+                    output_dir,
+                    medoid_data,
+                    medoid_timestamp_list,
+                    composite_type,
+                    ver,
+                    htile,
+                    vtile,
+                    year,
+                )
+        return dates_composite
 
 
 def build_vrt_mosaic(
@@ -310,6 +414,7 @@ def build_vrt_mosaic(
                         fid.flush()
                     cmd = [
                         "gdalbuildvrt",
+                        "-q",
                         "-input_file_list",
                         inputfile.as_posix(),
                         out_vrt.as_posix(),
@@ -321,6 +426,7 @@ def build_vrt_mosaic(
                     )
                     cmd = [
                         "gdalwarp",
+                        "-q",
                         "-t_srs",
                         "EPSG:4326",
                         "-te",
@@ -343,12 +449,14 @@ def build_vrt_mosaic(
     profile["compress"] = "DEFLATE"
     profile["zlevel"] = 9
     profile["predictor"] = 2
-    print(profile)
+
+    composite_names = dict()
     for comp in composite.keys():
         with tempfile.TemporaryDirectory() as tmpdir:
             outfile = outdir.joinpath(
                 f"FC_{comp}_Medoid.v{ver}.MCD43A4.{region}.{year}.006.tif"
             )
+            composite_names[comp] = outfile
             with rasterio.open(outfile.as_posix(), "w", **profile) as outds:
                 for idx, key in enumerate(
                     ["bare_soil", "phot_veg", "nphot_veg"]
@@ -364,6 +472,40 @@ def build_vrt_mosaic(
                 # build overviews with 5 levels
                 overviews = [2 ** j for j in range(1, overviews_level + 1)]
                 outds.build_overviews(overviews, resampling)
+    return composite_names
+
+
+def post_process(
+    cleanup_dir: Optional[Path] = None,
+    up_files: Optional[List[Path]] = None,
+    aws_session: Optional[boto3.Session.client] = None,
+    s3_bucket: Optional[str] = None,
+    bucket_prefix: Optional[str] = "",
+):
+    """Cleans up the directory created by the process and exit"""
+
+    def _s3_upload(fids):
+        s3_client = aws_session.client("s3")
+        for f in fids:
+            s3_upload(f, s3_client, s3_bucket, prefix=bucket_prefix)
+
+    if up_files is not None:
+        if (aws_session is None) | (s3_bucket is None):
+            STATUS_LOGGER.error(
+                f"Missing aws session and bucket object to upload files"
+                f" s3_bucket {s3_bucket} and aws_session is {aws_session}"
+            )
+        else:
+            _s3_upload(up_files)
+
+    if cleanup_dir is not None:
+        try:
+            shutil.rmtree(cleanup_dir)
+        except Exception:
+            STATUS_LOGGER.info(
+                f"failed at clean up of {cleanup_dir}", exc_info=True
+            )
+    sys.exit(0)
 
 
 @click.command(
@@ -399,6 +541,12 @@ def build_vrt_mosaic(
     show_default=True,
 )
 @click.option(
+    "--s3-bucket",
+    help="The name of s3-bucket to save output.",
+    type=click.STRING,
+    required=True,
+)
+@click.option(
     "--version",
     help="Product version",
     type=click.STRING,
@@ -411,17 +559,39 @@ def main(
     year: click.INT,
     output_dir: click.Path,
     composite_type: click.STRING,
+    s3_bucket: click.STRING,
     version: click.STRING,
 ):
     if region == "west":
         tiles = __west__
     else:
         raise NotImplementedError(f"{region} not implemented")
-
+    STATUS_LOGGER.info(f"Processing {composite_type} Fractional Cover: {region.upper()}")
+    # base metadata document for fractional cover composite
+    metadata_doc = {
+        "id": "",
+        "extents": [float(b) for b in __WA_BOUNDS__],
+        "product": "Fractional Cover",
+        "properties": {
+            "instrument": "MODIS",
+            "platform": ["AQU", "TER"],
+            "gsd": 500.0,
+            "epsg": 4326,
+            "provider": {"name": "Landgate", "roles": ["processor", "host"]},
+            "creation_datetime": datetime.datetime.utcnow().isoformat(),
+            "fileformat": "GTiff",
+            "region": f"{region.upper()}",
+        },
+        "Software": [
+            "Landgate fc-medoid 0.1.0",
+            "https://github.com/nci/geoglam.git:master",
+        ],
+    }
     with tempfile.TemporaryDirectory() as tmpdir:
         outdir = Path(output_dir).joinpath(f"{region}{year}")
         outdir.mkdir(exist_ok=True)
         indir = Path(tmpdir)
+        source_metadata = []
         for htile, vtile in tiles:
             fname = (
                 f"FC.v{version}.MCD43A4.h{htile:02d}"
@@ -430,16 +600,69 @@ def main(
 
             fc_path = Path(src_root_dir).joinpath(fname)
 
+            STATUS_LOGGER.info(f"computing medoid for {fname}")
+
             # if file does not exists then download from nci
             # thread serer
             if not fc_path.exists():
                 fc_path = download(fname, tmpdir)
+                source_metadata.append(f"{__base_url__}{fc_path.name}")
+            else:
+                source_metadata.append(str(fc_path))
 
-            compute_medoid(
+            _dates = compute_medoid(
                 fc_path, indir, version, composite_type, htile, vtile, year
             )
-        build_vrt_mosaic(indir, outdir, composite_type, region, year, version)
+        STATUS_LOGGER.info(f"Creating {region} Australia FC medoid mosaic")
+        _composites = build_vrt_mosaic(
+            indir, outdir, composite_type, region, year, version
+        )
+
+        metadata_doc["lineage"] = (source_metadata,)
+
+        up_files = []
+        for _k, val in _composites.items():
+            metadata_doc["id"] = str(uuid.uuid4())
+            metadata_doc["lineage"] = {
+                "source": source_metadata,
+                "composite_type": _k,
+                "composite_dates": _dates[_k],
+            }
+            metadata_doc["measurement"] = (
+                f"s3://{s3_bucket}/{region}{year}/{val.name}"
+            )
+            metadata_doc["bands"] = {
+                'band 1': 'bare soil',
+                'band 2': 'photosynthetic vegetation',
+                'band 3': 'non-photosynthetic vegetation'
+            }
+            up_files.append(val)
+            yaml_file = val.with_suffix(".yaml")
+            _munge_metadata(metadata_doc, yaml_file)
+            up_files.append(yaml_file)
+
+    # upload fractional cover mosiac to s3-bucket
+    try:
+        aws_session = boto3.Session()
+    except Exception:
+        STATUS_LOGGER.critical(
+            f"failed to initialize aws session", exc_info=True
+        )
+
+    # post process
+    post_process(
+        **{
+            "cleanup_dir": outdir,
+            "up_files": up_files,
+            "aws_session": aws_session,
+            "s3_bucket": s3_bucket,
+            "bucket_prefix": f"TEST_FractionalCover/{outdir.name}",
+        }
+    )
 
 
 if __name__ == "__main__":
+    LOG_CONFIG = Path(__file__).parent.joinpath("logging.cfg")
+    logging.config.fileConfig(LOG_CONFIG.as_posix())
+    STATUS_LOGGER = logging.getLogger()
     main()
