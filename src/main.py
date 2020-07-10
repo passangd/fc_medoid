@@ -499,13 +499,32 @@ def post_process(
     aws_session: Optional[boto3.Session.client] = None,
     s3_bucket: Optional[str] = None,
     bucket_prefix: Optional[str] = "",
+    ingest_database: Optional[bool] = False,
+    db_table_name: Optional[bool] = "",
 ):
     """Cleans up the directory created by the process and exit"""
 
     def _s3_upload(fids):
+        dynb_db = boto3.resource('dynamodb')
+        table = dynb_db.Table(db_table_name)
         s3_client = aws_session.client("s3")
         for f in fids:
             s3_upload(f, s3_client, s3_bucket, prefix=bucket_prefix)
+
+            if ingest_database:
+                if f.suffix == ".yaml":
+                    with open(f.as_posix()) as fid:
+                        meta = yaml.safe_load(fid)
+                        item = {
+                            "id": meta["id"],
+                            "composite": meta["lineage"]["composite_type"],
+                            "region": meta["properties"]["region"],
+                            "composite_year": meta["lineage"]["composite_dates"][0].year,
+                            "sensor": meta["properties"]["instrument"],
+                            "creation_datetime": meta["properties"]["creation_datetime"],
+                            "path": meta["measurement"]
+                        }
+                        table.put_item(Item=item)
 
     if up_files is not None:
         if (aws_session is None) | (s3_bucket is None):
@@ -523,7 +542,7 @@ def post_process(
             STATUS_LOGGER.info(
                 f"failed at clean up of {cleanup_dir}", exc_info=True
             )
-    sys.exit(0)
+    # sys.exit(0)
 
 
 @click.command(
@@ -565,6 +584,18 @@ def post_process(
     required=True,
 )
 @click.option(
+    "--ingest-database",
+    help="Whether to update processing records to database",
+    is_flag=True,
+    show_default=True,
+)
+@click.option(
+    "--db-table-name",
+    help="The AWS dynamo  database table name",
+    type=click.STRING,
+    default="DSR_FractionalCover"
+)
+@click.option(
     "--version",
     help="Product version",
     type=click.STRING,
@@ -578,6 +609,8 @@ def main(
     output_dir: click.Path,
     composite_type: click.STRING,
     s3_bucket: click.STRING,
+    ingest_database: click.BOOL,
+    db_table_name: click.STRING,
     version: click.STRING,
 ):
     if region == "west":
@@ -677,7 +710,9 @@ def main(
                 "up_files": up_files,
                 "aws_session": aws_session,
                 "s3_bucket": s3_bucket,
-                "bucket_prefix": f"TEST_FractionalCover/{outdir.name}",
+                "bucket_prefix": f"MODIS_FractionalCover/{outdir.name}",
+                "ingest_database": ingest_database,
+                "db_table_name": db_table_name,
             }
         )
 
