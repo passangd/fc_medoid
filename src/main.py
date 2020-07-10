@@ -618,103 +618,102 @@ def main(
     else:
         raise NotImplementedError(f"{region} not implemented")
 
-    for year in range(2001, 2021):
-        STATUS_LOGGER.info(f"Processing {composite_type} Fractional Cover: {region.upper()}")
-        # base metadata document for fractional cover composite
-        metadata_doc = {
-            "id": "",
-            "extents": [float(b) for b in __WA_BOUNDS__],
-            "product": "Fractional Cover",
-            "product_type": "medoid",
-            "properties": {
-                "instrument": "MODIS",
-                "platform": ["AQU", "TER"],
-                "gsd": 500.0,
-                "epsg": 4326,
-                "provider": {"name": "Landgate", "roles": ["processor", "host"]},
-                "creation_datetime": datetime.datetime.utcnow().isoformat(),
-                "fileformat": "GTiff",
-                "region": f"{region.upper()}",
-            },
-            "Software": [
-                "Landgate fc-medoid 0.1.0",
-                "https://github.com/nci/geoglam.git:master",
-            ],
-        }
-        with tempfile.TemporaryDirectory() as tmpdir:
-            outdir = Path(output_dir).joinpath(f"{region}{year}")
-            outdir.mkdir(exist_ok=True)
-            indir = Path(tmpdir)
-            source_metadata = []
-            for htile, vtile in tiles:
-                fname = (
-                    f"FC.v{version}.MCD43A4.h{htile:02d}"
-                    f"v{vtile:02}.{year}.006.nc"
-                )
-
-                fc_path = Path(src_root_dir).joinpath(fname)
-
-                STATUS_LOGGER.info(f"computing medoid for {fname}")
-
-                # if file does not exists then download from nci
-                # thread serer
-                if not fc_path.exists():
-                    fc_path = download(fname, tmpdir)
-                    source_metadata.append(f"{__base_url__}{fc_path.name}")
-                else:
-                    source_metadata.append(str(fc_path))
-
-                _dates = compute_medoid(
-                    fc_path, indir, version, composite_type, htile, vtile, year
-                )
-            STATUS_LOGGER.info(f"Creating {region} Australia FC medoid mosaic")
-            _composites = build_vrt_mosaic(
-                indir, outdir, composite_type, region, year, version
+    STATUS_LOGGER.info(f"Processing {composite_type} Fractional Cover: {region.upper()}")
+    # base metadata document for fractional cover composite
+    metadata_doc = {
+        "id": "",
+        "extents": [float(b) for b in __WA_BOUNDS__],
+        "product": "Fractional Cover",
+        "product_type": "medoid",
+        "properties": {
+            "instrument": "MODIS",
+            "platform": ["AQU", "TER"],
+            "gsd": 500.0,
+            "epsg": 4326,
+            "provider": {"name": "Landgate", "roles": ["processor", "host"]},
+            "creation_datetime": datetime.datetime.utcnow().isoformat(),
+            "fileformat": "GTiff",
+            "region": f"{region.upper()}",
+        },
+        "Software": [
+            "Landgate fc-medoid 0.1.0",
+            "https://github.com/nci/geoglam.git:master",
+        ],
+    }
+    with tempfile.TemporaryDirectory() as tmpdir:
+        outdir = Path(output_dir).joinpath(f"{region}{year}")
+        outdir.mkdir(exist_ok=True)
+        indir = Path(tmpdir)
+        source_metadata = []
+        for htile, vtile in tiles:
+            fname = (
+                f"FC.v{version}.MCD43A4.h{htile:02d}"
+                f"v{vtile:02}.{year}.006.nc"
             )
 
-            metadata_doc["lineage"] = (source_metadata,)
+            fc_path = Path(src_root_dir).joinpath(fname)
 
-            up_files = []
-            for _k, val in _composites.items():
-                metadata_doc["id"] = str(uuid.uuid4())
-                metadata_doc["lineage"] = {
-                    "source": source_metadata,
-                    "composite_type": _k,
-                    "composite_dates": _dates[_k],
-                }
-                metadata_doc["measurement"] = (
-                    f"s3://{s3_bucket}/{region}{year}/{val.name}"
-                )
-                metadata_doc["bands"] = {
-                    'band 1': 'bare soil',
-                    'band 2': 'photosynthetic vegetation',
-                    'band 3': 'non-photosynthetic vegetation'
-                }
-                up_files.append(val)
-                yaml_file = val.with_suffix(".yaml")
-                _munge_metadata(metadata_doc, yaml_file)
-                up_files.append(yaml_file)
+            STATUS_LOGGER.info(f"computing medoid for {fname}")
 
-        # upload fractional cover mosiac to s3-bucket
-        try:
-            aws_session = boto3.Session()
-        except Exception:
-            STATUS_LOGGER.critical(
-                f"failed to initialize aws session", exc_info=True
+            # if file does not exists then download from nci
+            # thread serer
+            if not fc_path.exists():
+                fc_path = download(fname, tmpdir)
+                source_metadata.append(f"{__base_url__}{fc_path.name}")
+            else:
+                source_metadata.append(str(fc_path))
+
+            _dates = compute_medoid(
+                fc_path, indir, version, composite_type, htile, vtile, year
             )
-
-        # post process
-        post_process(
-            **{
-                "cleanup_dir": outdir,
-                "up_files": up_files,
-                "aws_session": aws_session,
-                "s3_bucket": s3_bucket,
-                "bucket_prefix": f"MODIS_FractionalCover/{outdir.name}",
-                "ingest_database": ingest_database,
-                "db_table_name": db_table_name,
-            }
+        STATUS_LOGGER.info(f"Creating {region} Australia FC medoid mosaic")
+        _composites = build_vrt_mosaic(
+            indir, outdir, composite_type, region, year, version
         )
+
+        metadata_doc["lineage"] = (source_metadata,)
+
+        up_files = []
+        for _k, val in _composites.items():
+            metadata_doc["id"] = str(uuid.uuid4())
+            metadata_doc["lineage"] = {
+                "source": source_metadata,
+                "composite_type": _k,
+                "composite_dates": _dates[_k],
+            }
+            metadata_doc["measurement"] = (
+                f"s3://{s3_bucket}/{region}{year}/{val.name}"
+            )
+            metadata_doc["bands"] = {
+                'band 1': 'bare soil',
+                'band 2': 'photosynthetic vegetation',
+                'band 3': 'non-photosynthetic vegetation'
+            }
+            up_files.append(val)
+            yaml_file = val.with_suffix(".yaml")
+            _munge_metadata(metadata_doc, yaml_file)
+            up_files.append(yaml_file)
+
+    # upload fractional cover mosiac to s3-bucket
+    try:
+        aws_session = boto3.Session()
+    except Exception:
+        STATUS_LOGGER.critical(
+            f"failed to initialize aws session", exc_info=True
+        )
+
+    # post process
+    post_process(
+        **{
+            "cleanup_dir": outdir,
+            "up_files": up_files,
+            "aws_session": aws_session,
+            "s3_bucket": s3_bucket,
+            "bucket_prefix": f"MODIS_FractionalCover/{outdir.name}",
+            "ingest_database": ingest_database,
+            "db_table_name": db_table_name,
+        }
+    )
 
 
 if __name__ == "__main__":
