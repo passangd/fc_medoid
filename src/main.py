@@ -493,6 +493,33 @@ def build_vrt_mosaic(
     return composite_names
 
 
+def sns_send(
+    aws_session: boto3.Session,
+    topic_arn: str,
+    messages: Optional[str] = "",
+    subject: Optional[str] = "",
+    msg_attributes: Optional[dict] = None,
+):
+    """Simple notification service to report pgr status.
+
+    :param aws_session: The aws session to invoke sns client.
+    :param topic_arn: The sns topic arn to publish the message.
+    :param messages: The messages to be published.
+    :param subject: The subject of an sns message.
+    :param msg_attributes: The MessageAttributes for sns service.
+    """
+    if msg_attributes is None:
+        msg_attributes = {}
+
+    sns_client = aws_session.client("sns")
+    sns_client.publish(
+        TopicArn=topic_arn,
+        Subject=subject,
+        Message=messages,
+        MessageAttributes=msg_attributes,
+    )
+
+
 def post_process(
     cleanup_dir: Optional[Path] = None,
     up_files: Optional[List[Path]] = None,
@@ -501,6 +528,7 @@ def post_process(
     bucket_prefix: Optional[str] = "",
     ingest_database: Optional[bool] = False,
     db_table_name: Optional[bool] = "",
+    sns_arn: Optional[str] = None,
 ):
     """Cleans up the directory created by the process and exit"""
 
@@ -526,6 +554,16 @@ def post_process(
                         }
                         table.put_item(Item=item)
 
+            if f.suffix == ".tif":
+                if sns_arn is not None:
+                    sns_send(
+                        aws_session,
+                        sns_arn,
+                        messages=f"",
+                        subject=f"FC Processing Completed: {f.name}",
+                        msg_attributes=None
+                    )
+
     if up_files is not None:
         if (aws_session is None) | (s3_bucket is None):
             STATUS_LOGGER.error(
@@ -542,7 +580,8 @@ def post_process(
             STATUS_LOGGER.info(
                 f"failed at clean up of {cleanup_dir}", exc_info=True
             )
-    # sys.exit(0)
+
+    sys.exit(0)
 
 
 @click.command(
@@ -596,6 +635,12 @@ def post_process(
     default="DSR_FractionalCover"
 )
 @click.option(
+    "--sns-arn",
+    help="AWS SNS Topic Arn for notification service",
+    type=click.STRING,
+    default=None,
+)
+@click.option(
     "--version",
     help="Product version",
     type=click.STRING,
@@ -611,6 +656,7 @@ def main(
     s3_bucket: click.STRING,
     ingest_database: click.BOOL,
     db_table_name: click.STRING,
+    sns_arn: click.STRING,
     version: click.STRING,
 ):
     if region == "west":
@@ -712,6 +758,7 @@ def main(
             "bucket_prefix": f"MODIS_FractionalCover/{outdir.name}",
             "ingest_database": ingest_database,
             "db_table_name": db_table_name,
+            "sns_arn": sns_arn,
         }
     )
 
