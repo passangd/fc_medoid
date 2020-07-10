@@ -566,7 +566,7 @@ def post_process(
                     sns_send(
                         aws_session,
                         sns_arn,
-                        messages=f"",
+                        messages=f"FC processing completed.",
                         subject=f"FC Processing Completed: {f.name}",
                         msg_attributes=None
                     )
