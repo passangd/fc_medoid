@@ -138,13 +138,16 @@ def s3_upload(
         s3_client.head_object(Bucket=bucket, Key=s3_path)
         if replace:
             s3_client.upload_file(up_file.as_posix(), bucket, Key=s3_path)
+            return True
         else:
             STATUS_LOGGER.info(
                 f"{filename} exists in {bucket}/{prefix}, skipped upload"
             )
+            return False
     except ClientError:
         try:
             s3_client.upload_file(up_file.as_posix(), bucket, Key=s3_path)
+            return True
         except ClientError:
             raise ValueError(
                 f"failed to upload {filename} at {bucket}/{prefix}"
@@ -260,9 +263,8 @@ def pack_data(
 
 
 def compute_medoid(
-    filename, output_dir, ver, composite_type, htile, vtile, year
+    filename, output_dir, ver, composite_type, htile, vtile, year,
 ):
-
     with netCDF4.Dataset(filename) as ds:
         month_idx_tmp = [[] for _ in range(12)]
         season_idx_tmp = [[] for _ in range(4)]
@@ -318,6 +320,7 @@ def compute_medoid(
         # checks if season has all three month's data to form
         # a seasonal composite
         for i in range(len(season_idx_tmp)):
+
             s = season_idx_tmp[i]
             if len(s) == 0:
                 continue
@@ -537,7 +540,11 @@ def post_process(
         table = dynb_db.Table(db_table_name)
         s3_client = aws_session.client("s3")
         for f in fids:
-            s3_upload(f, s3_client, s3_bucket, prefix=bucket_prefix)
+            up_flag = s3_upload(
+                f, s3_client, s3_bucket, prefix=bucket_prefix, replace=False
+            )
+            if not up_flag:
+                continue
 
             if ingest_database:
                 if f.suffix == ".yaml":
