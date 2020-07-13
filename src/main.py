@@ -262,6 +262,34 @@ def pack_data(
                     )
 
 
+def prev_year_december_data(fname, year):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        str1 = f".{year}"
+        str2 = f".{year-1}"
+        fname1 = Path(fname).name.replace(str1, str2)
+        fc_path = download(fname1, tmpdir)
+        dec_idx = []
+        dec_timestamp = []
+        with netCDF4.Dataset(fc_path) as ds:
+            for its, ts in enumerate(ds["time"]):
+                date = cftime.num2pydate(ts, ds["time"].units)
+                if date.month - 1 == 11:
+                    dec_idx.append(its)
+                    dec_timestamp.append(date)
+
+            pv = np.asarray(ds["phot_veg"][dec_idx, ...], dtype=np.float32)
+            npv = np.asarray(ds["nphot_veg"][dec_idx, ...], dtype=np.float32)
+            soil = np.asarray(ds["bare_soil"][dec_idx, ...], dtype=np.float32)
+
+            data = np.empty(
+                (len(dec_idx), 3, pv.shape[1], pv.shape[2]), dtype=pv.dtype
+            )
+            data[:, 0, :, :] = pv
+            data[:, 1, :, :] = npv
+            data[:, 2, :, :] = soil
+            return data, dec_timestamp
+
+
 def compute_medoid(
     filename, output_dir, ver, composite_type, htile, vtile, year,
 ):
@@ -290,6 +318,13 @@ def compute_medoid(
                 [__spring__, __summer__, __autumn__, __winter__]
             ):
                 if date.month - 1 in season:
+
+                    # for seasonal composite, do not include december
+                    # from current year, it will be from previous year
+                    # december month
+                    if date.month - 1 == 11:
+                        continue
+
                     season_idx_tmp[_its].append(its)
                     try:
                         season_idx_dates[__index_map__["season"][_its]].append(
@@ -329,8 +364,14 @@ def compute_medoid(
                     for j in range(len(s))
             ]
             months = set([t.month for t in ts])
+
+            # if set is not len eq 3 then accepts if it is
+            # for summer season (Dec, Jan, Feb) else, set to empty
             if len(months) != 3:
-                season_idx_tmp[i] = []
+                if 2 in set(months):
+                    continue
+                else:
+                    season_idx_tmp[i] = []
 
         month_idx = [m for m in month_idx_tmp if len(m) > 0]
         season_idx = [s for s in season_idx_tmp if len(s) > 0]
@@ -362,11 +403,17 @@ def compute_medoid(
             # compute seasonal medoid
             dates_composite = season_idx_dates
             for s, s_idx in enumerate(season_idx):
-                sdata = data[s_idx, ...]
-                season_medoid = medoid(sdata)
-                medoid_data_list.append(season_medoid)
                 ts = cftime.num2pydate(ds["time"][s_idx[0]], ds["time"].units)
                 ts = ts.replace(day=1)
+                sdata = data[s_idx, ...]
+                if ts.month - 1 in __summer__:
+                    if year > 2001:
+                        prev_dec_data, prev_dec_time = prev_year_december_data(filename, year)
+                        sdata = np.concatenate([prev_dec_data, sdata])
+                        for _d in prev_dec_time:
+                            dates_composite["Summer"].append(_d)
+                season_medoid = medoid(sdata)
+                medoid_data_list.append(season_medoid)
                 medoid_timestamp_list.append(ts)
         else:
             raise NotImplementedError(
@@ -728,9 +775,19 @@ def main(
 
         up_files = []
         for _k, val in _composites.items():
+            new_source_metadata = source_metadata
+            if (_k == "Summer") & (year > 2001):
+                new_source_metadata = (
+                    source_metadata
+                    + [
+                        str(src).replace(f".{year}", f".{year-1}")
+                        for src in source_metadata
+                    ]
+                )
+
             metadata_doc["id"] = str(uuid.uuid4())
             metadata_doc["lineage"] = {
-                "source": source_metadata,
+                "source": new_source_metadata,
                 "composite_type": _k,
                 "composite_dates": _dates[_k],
             }
