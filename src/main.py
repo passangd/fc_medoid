@@ -224,6 +224,10 @@ def _munge_metadata(metadata_doc: dict, outfile: Path):
             lineage[param] = val
 
     metadata_doc["lineage"] = lineage
+    dts = metadata_doc["lineage"]["composite_dates"]
+    metadata_doc["lineage"]["composite_dates"] = [
+        dt.strftime("%Y-%m-%d %H:%M:%S") for dt in dts
+    ]
     with open(outfile.as_posix(), "w") as fid:
         yaml.dump(metadata_doc, fid, sort_keys=False)
 
@@ -596,7 +600,7 @@ def post_process(
             if ingest_database:
                 if f.suffix == ".yaml":
                     with open(f.as_posix()) as fid:
-                        meta = yaml.safe_load(fid)
+                        meta = yaml.load(fid, Loader=yaml.BaseLoader)
                         item = {
                             "id": meta["id"],
                             "composite": meta["lineage"]["composite_type"],
@@ -763,9 +767,11 @@ def main(
             else:
                 source_metadata.append(str(fc_path))
 
-            _dates = compute_medoid(
-                fc_path, indir, version, composite_type, htile, vtile, year
-            )
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=DeprecationWarning)
+                _dates = compute_medoid(
+                    fc_path, indir, version, composite_type, htile, vtile, year
+                )
         STATUS_LOGGER.info(f"Creating {region} Australia FC medoid mosaic")
         _composites = build_vrt_mosaic(
             indir, outdir, composite_type, region, year, version
