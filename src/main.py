@@ -605,7 +605,12 @@ def post_process(
                             "id": meta["id"],
                             "composite": meta["lineage"]["composite_type"],
                             "region": meta["properties"]["region"],
-                            "composite_year": meta["lineage"]["composite_dates"][0].year,
+                            "composite_year": (
+                                datetime.datetime.strptime(
+                                    meta["lineage"]["composite_dates"][0],
+                                    "%Y-%m-%d %H:%M:%S"
+                                ).year
+                            ),
                             "sensor": meta["properties"]["instrument"],
                             "creation_datetime": meta["properties"]["creation_datetime"],
                             "path": meta["measurement"]
