@@ -16,7 +16,7 @@ pandas==1.0.5
 pyparsing==2.4.7
 python-dateutil==2.8.1
 pytz==2020.1
-PyYAML==5.3.1
+PyYAML==5.4
 rasterio==1.1.5
 s3transfer==0.3.3
 six==1.15.0
